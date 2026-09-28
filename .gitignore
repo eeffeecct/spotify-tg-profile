@@ -1,0 +1,11 @@
+.env
+.cache
+*.session
+*.session-journal
+state.json
+cover.jpg
+.venv/
+__pycache__/
+.idea/
+*.log
+*.lock

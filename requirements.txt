@@ -1,0 +1,5 @@
+kurigram>=2.2.26
+spotipy>=2.26.0
+requests>=2.32
+python-dotenv>=1.0
+pillow>=11.0
