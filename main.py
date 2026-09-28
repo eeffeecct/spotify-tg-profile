@@ -1,7 +1,6 @@
 """Ставит обложку текущего трека из Spotify на аватарку Telegram, название — в био,
-🎧 в эмодзи-статус и красит профиль в цвет обложки."""
+🎧 в эмодзи-статус и красит профиль в цвет обложки. Управление — командами в «Избранном» (.help)."""
 import asyncio
-from collections import deque
 import colorsys
 import io
 import json
@@ -9,15 +8,18 @@ import logging
 import os
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
 import spotipy
 from dotenv import load_dotenv
 from PIL import Image
-from pyrogram import Client, raw, types
+from pyrogram import Client, filters, raw, types
 from pyrogram.errors import AuthKeyUnregistered, FloodWait, RPCError
+from pyrogram.handlers import MessageHandler
 from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
 
 BASE_DIR = Path(__file__).resolve().parent  # всё (сессия, токены, state) лежит рядом со скриптом
@@ -32,6 +34,9 @@ def env_flag(name: str, default: bool) -> bool:
 
 SPOTIFY_CACHE = BASE_DIR / ".cache"
 STATE_FILE = BASE_DIR / "state.json"  # помним, что поменяли, и исходный профиль между перезапусками
+BLACKLIST_FILE = BASE_DIR / "blacklist.txt"
+LOG_FILE = BASE_DIR / "bot.log"
+LOCK_FILE = BASE_DIR / "bot.lock"
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 5))    # как часто спрашивать Spotify, сек
 IDLE_TIMEOUT = float(os.getenv("IDLE_TIMEOUT", 60))     # через сколько после паузы вернуть профиль, сек
 BIO_TEMPLATE = os.getenv("BIO_TEMPLATE", "🎧 {artist} — {title}")
@@ -54,6 +59,7 @@ class Track:
     cover_url: str | None
     progress: float  # сколько секунд трек уже играет
     duration: float
+    artists: tuple[str, ...] = ()
 
     @property
     def bio(self) -> str:
@@ -154,6 +160,7 @@ def fetch_current_track(sp: spotipy.Spotify) -> Track | None:
         cover_url=images[0]["url"] if images else None,
         progress=(data.get("progress_ms") or 0) / 1000,
         duration=(item.get("duration_ms") or 0) / 1000,
+        artists=tuple(a["name"] for a in item.get("artists", [])),
     )
 
 
@@ -336,6 +343,7 @@ class Profile:
         await self._call(self.app.update_profile, bio=track.bio)
         await self.refresh_status(track)
         self.state["track_uri"] = track.uri
+        self.state["track_title"] = f"{track.artist} — {track.title}"
         self._save()
 
     async def restore(self):
@@ -350,10 +358,257 @@ class Profile:
         if "profile_color_id" in self.state:
             await self._set_profile_color(None)
         self.state.pop("track_uri", None)
+        self.state.pop("track_title", None)
         self._save()
 
 
-# ---------- main loop ----------
+# ---------- чёрный список ----------
+
+class Blacklist:
+    """blacklist.txt: по строке на запись — `spotify:track:…` (конкретный трек) или имя артиста.
+    Всё после ` #` — комментарий. Файл можно править руками, бот перечитывает его на лету."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.entries: dict[str, str] = {}  # запись -> комментарий
+        self._mtime: float | None = None
+
+    def _reload(self):
+        try:
+            mtime = self.path.stat().st_mtime
+        except FileNotFoundError:
+            self.entries, self._mtime = {}, None
+            return
+        if mtime == self._mtime:
+            return
+        self.entries = {}
+        for line in self.path.read_text("utf-8").splitlines():
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            key, _, comment = line.partition(" #")
+            self.entries[key.strip()] = comment.strip()
+        self._mtime = mtime
+
+    def _write(self):
+        lines = [f"{k}  # {c}" if c else k for k, c in self.entries.items()]
+        self.path.write_text("\n".join(lines) + "\n" if lines else "", "utf-8")
+        self._mtime = self.path.stat().st_mtime
+
+    def _find(self, key: str) -> str | None:
+        return next((k for k in self.entries if k.lower() == key.lower()), None)
+
+    def matches(self, track: Track) -> bool:
+        self._reload()
+        return track.uri in self.entries or any(self._find(a) for a in track.artists)
+
+    def add(self, key: str, comment: str = "") -> bool:
+        self._reload()
+        if self._find(key):
+            return False
+        self.entries[key] = comment
+        self._write()
+        return True
+
+    def remove(self, key: str) -> bool:
+        self._reload()
+        found = self._find(key)
+        if not found:
+            return False
+        del self.entries[found]
+        self._write()
+        return True
+
+    def items(self) -> list[tuple[str, str]]:
+        self._reload()
+        return list(self.entries.items())
+
+
+# ---------- бот: цикл + команды в «Избранном» ----------
+
+HELP = """🎧 Команды (пиши в «Избранное»):
+.status — что сейчас в профиле
+.off — пауза: вернуть профиль и не трогать, пока не .on
+.on — снова показывать музыку
+.ban — скрыть текущий трек
+.ban Имя артиста — скрыть артиста
+.unban [Имя артиста] — убрать из чёрного списка (без имени — текущий трек)
+.bans — чёрный список
+.stop — вернуть профиль и выключить бота"""
+
+
+class Bot:
+    def __init__(self, app: Client, sp: spotipy.Spotify):
+        self.app = app
+        self.sp = sp
+        self.profile = Profile(app)
+        self.blacklist = Blacklist(BLACKLIST_FILE)
+        self.lock = asyncio.Lock()  # цикл и команды не должны менять профиль одновременно
+        self.stopped = asyncio.Event()
+        self.current: Track | None = None  # что сейчас играет в Spotify
+        self.idle_since: float | None = None
+        self.throttled_uri: str | None = None  # чтобы писать в лог про лимит один раз на трек
+        self.updates: deque[float] = deque()  # когда меняли профиль (для лимита MAX_UPDATES / UPDATE_WINDOW)
+
+    @property
+    def paused(self) -> bool:
+        return self.profile.state.get("paused", False)
+
+    async def tick(self) -> float:
+        """Один опрос Spotify. Возвращает, через сколько секунд опросить снова."""
+        loop = asyncio.get_running_loop()
+        track = await asyncio.to_thread(fetch_current_track, self.sp)
+        self.current = track
+        async with self.lock:
+            if self.paused:
+                return POLL_INTERVAL
+            if track is None or self.blacklist.matches(track):  # трек из чёрного списка = ничего не играет
+                self.idle_since = self.idle_since or loop.time()
+                if self.profile.active and loop.time() - self.idle_since >= IDLE_TIMEOUT:
+                    log.info("Музыка не играет — возвращаю профиль")
+                    await self.profile.restore()
+                return POLL_INTERVAL
+
+            self.idle_since = None
+            while self.updates and loop.time() - self.updates[0] >= UPDATE_WINDOW:
+                self.updates.popleft()
+            rate_wait = UPDATE_WINDOW - (loop.time() - self.updates[0]) if len(self.updates) >= MAX_UPDATES else 0
+            # быстро листаешь треки — профиль не дёргается: трек должен играть MIN_LISTEN секунд
+            if track.uri != self.profile.track_uri and track.progress >= MIN_LISTEN and rate_wait <= 0:
+                await self.profile.show(track)
+                self.updates.append(loop.time())
+                log.info("Сейчас играет: %s — %s", track.artist, track.title)
+                return POLL_INTERVAL
+
+            if self.profile.active and self.profile.status_expiring:
+                await self.profile.refresh_status(track)  # длинная пауза между сменами, повтор трека
+            if track.uri == self.profile.track_uri:
+                return POLL_INTERVAL
+            if rate_wait > 0 and self.throttled_uri != track.uri:
+                self.throttled_uri = track.uri
+                log.info("Слишком часто листаешь — обновлю профиль через %.0f с", rate_wait)
+            # проснёмся ровно когда новый трек можно ставить
+            wait = max(MIN_LISTEN - track.progress, rate_wait)
+            return min(POLL_INTERVAL, max(wait + 0.2, 0.5))
+
+    async def run(self):
+        await self.profile.init()
+        self.app.add_handler(MessageHandler(
+            self.on_command, filters.chat("me") & filters.text & filters.regex(r"(?i)^\.[a-z]+\b")))
+        log.info("Запущен, слежу за Spotify каждые %s с%s", POLL_INTERVAL, " (на паузе, .on — включить)" if self.paused else "")
+        try:
+            while not self.stopped.is_set():
+                delay = POLL_INTERVAL
+                try:
+                    delay = await self.tick()
+                except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException, RPCError) as e:
+                    log.warning("Ошибка, попробую ещё раз: %s", e)
+                except Exception:
+                    log.exception("Неожиданная ошибка, продолжаю работать")
+                try:
+                    await asyncio.wait_for(self.stopped.wait(), delay)
+                except TimeoutError:
+                    pass
+        finally:
+            log.info("Выключаюсь — возвращаю профиль")
+            try:
+                async with self.lock:
+                    await self.profile.restore()
+            except Exception as e:
+                log.error("Не удалось вернуть профиль (%s) — вернётся при следующем запуске", e)
+
+    # ----- команды -----
+
+    async def on_command(self, _, message):
+        cmd, _, arg = message.text.strip().partition(" ")
+        handler = {
+            ".help": self.cmd_help, ".status": self.cmd_status, ".on": self.cmd_on, ".off": self.cmd_off,
+            ".ban": self.cmd_ban, ".unban": self.cmd_unban, ".bans": self.cmd_bans, ".stop": self.cmd_stop,
+        }.get(cmd.lower())
+        if handler is None:  # обычная заметка с точкой — не наше дело
+            return
+        log.info("Команда: %s", message.text.strip())
+        try:
+            reply = await handler(arg.strip())
+        except Exception as e:
+            log.exception("Команда %s упала", cmd)
+            reply = f"⚠️ Ошибка: {e}"
+        try:
+            await message.edit_text(reply)
+        except RPCError as e:
+            log.warning("Не удалось ответить на команду: %s", e)
+        if cmd.lower() == ".stop":
+            self.stopped.set()
+
+    async def cmd_help(self, _):
+        return HELP
+
+    async def cmd_status(self, _):
+        now = f"{self.current.artist} — {self.current.title}" if self.current else "ничего"
+        if self.current and self.blacklist.matches(self.current):
+            now += " (в чёрном списке)"
+        shown = self.profile.state.get("track_title") or "ничего (профиль как обычно)"
+        return (f"{'⏸ На паузе' if self.paused else '▶️ Работает'}\n"
+                f"В Spotify: {now}\n"
+                f"В профиле: {shown}\n"
+                f"В чёрном списке: {len(self.blacklist.items())}\n\n.help — команды")
+
+    async def cmd_on(self, _):
+        if not self.paused:
+            return "▶️ Бот и так работает"
+        self.profile.state.pop("paused", None)
+        self.profile._save()
+        self.idle_since = None
+        return "▶️ Включил — музыка снова будет в профиле"
+
+    async def cmd_off(self, _):
+        async with self.lock:
+            self.profile.state["paused"] = True
+            await self.profile.restore()
+            self.profile._save()
+        return "⏸ На паузе, профиль вернул как было. .on — включить"
+
+    async def cmd_ban(self, arg):
+        if arg:
+            added = self.blacklist.add(arg)
+            text = f"🚫 Артист «{arg}» больше не попадёт в профиль" if added else f"«{arg}» уже в чёрном списке"
+        elif self.current:
+            added = self.blacklist.add(self.current.uri, f"{self.current.artist} — {self.current.title}")
+            text = (f"🚫 Трек «{self.current.artist} — {self.current.title}» больше не попадёт в профиль"
+                    if added else "Этот трек уже в чёрном списке")
+        else:
+            return "Сейчас ничего не играет. Чтобы скрыть артиста: .ban Имя артиста"
+        await self._hide_if_banned()
+        return text
+
+    async def cmd_unban(self, arg):
+        if arg:
+            return f"✅ «{arg}» убран из чёрного списка" if self.blacklist.remove(arg) else f"«{arg}» нет в чёрном списке"
+        if not self.current:
+            return "Сейчас ничего не играет. Чтобы вернуть артиста: .unban Имя артиста"
+        if self.blacklist.remove(self.current.uri):
+            return f"✅ Трек «{self.current.artist} — {self.current.title}» убран из чёрного списка"
+        return "Этого трека нет в чёрном списке (если скрыт артист — .unban Имя артиста)"
+
+    async def cmd_bans(self, _):
+        items = self.blacklist.items()
+        if not items:
+            return "Чёрный список пуст. .ban — скрыть текущий трек, .ban Имя — артиста"
+        lines = [f"• {c or k}" + (" (трек)" if k.startswith("spotify:track:") else "") for k, c in items]
+        return "🚫 Чёрный список:\n" + "\n".join(lines)
+
+    async def cmd_stop(self, _):
+        return "⏹ Выключаюсь, профиль верну как было. Запустить снова — перезайти в Windows или запустить main.py"
+
+    async def _hide_if_banned(self):
+        # если в профиле прямо сейчас то, что забанили, — убираем сразу
+        async with self.lock:
+            shown = self.profile.track_uri
+            if shown and (shown in dict(self.blacklist.items())
+                          or (self.current and self.current.uri == shown and self.blacklist.matches(self.current))):
+                await self.profile.restore()
+
+
+# ---------- запуск ----------
 
 async def run():
     sp = make_spotify()
@@ -363,66 +618,66 @@ async def run():
         api_hash=os.environ["TG_API_HASH"],
         workdir=str(BASE_DIR),
     )
-
     async with app:
-        profile = Profile(app)
-        await profile.init()
-        loop = asyncio.get_running_loop()
-        idle_since: float | None = None
-        throttled_uri: str | None = None  # чтобы писать в лог про лимит один раз на трек
-        updates: deque[float] = deque()  # когда меняли профиль (для лимита MAX_UPDATES / UPDATE_WINDOW)
-        log.info("Запущен, слежу за Spotify каждые %s с", POLL_INTERVAL)
+        await Bot(app, sp).run()
 
+
+def setup_logging():
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding="utf-8")]
+    if sys.stderr:  # под pythonw (фоновый запуск) консоли нет
+        sys.stderr.reconfigure(errors="replace")  # иероглифы в названиях не должны ронять логи
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        datefmt="%d.%m %H:%M:%S", handlers=handlers)
+    logging.getLogger("pyrogram").setLevel(logging.WARNING)  # без «Connecting…» на каждый чих
+
+
+def single_instance():
+    """Не даём запустить второго бота на ту же сессию. Возвращает открытый lock-файл (держим до выхода)."""
+    lock = open(LOCK_FILE, "w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
+    return lock
+
+
+def main():
+    setup_logging()
+    lock = single_instance()
+    if lock is None:
+        log.error("Бот уже запущен (возможно, в фоне). Второй экземпляр не нужен — управляй им через .status/.stop в «Избранном»")
+        return
+    session = BASE_DIR / f"{os.getenv('TG_SESSION', 'my_account')}.session"
+    if not sys.stdin and not session.exists():
+        log.error("Нет сессии Telegram, а в фоне войти нельзя. Запусти один раз в консоли: .venv\\Scripts\\python main.py")
+        return
+
+    backoff = 10
+    while True:
+        started = time.monotonic()
         try:
-            while True:
-                delay = POLL_INTERVAL
-                try:
-                    track = await asyncio.to_thread(fetch_current_track, sp)
-                    if track is None:
-                        idle_since = idle_since or loop.time()
-                        if profile.active and loop.time() - idle_since >= IDLE_TIMEOUT:
-                            log.info("Музыка не играет — возвращаю профиль")
-                            await profile.restore()
-                    else:
-                        idle_since = None
-                        while updates and loop.time() - updates[0] >= UPDATE_WINDOW:
-                            updates.popleft()
-                        rate_wait = UPDATE_WINDOW - (loop.time() - updates[0]) if len(updates) >= MAX_UPDATES else 0
-                        # быстро листаешь треки — профиль не дёргается: трек должен играть MIN_LISTEN секунд
-                        if track.uri != profile.track_uri and track.progress >= MIN_LISTEN and rate_wait <= 0:
-                            await profile.show(track)
-                            updates.append(loop.time())
-                            log.info("Сейчас играет: %s — %s", track.artist, track.title)
-                        else:
-                            if profile.active and profile.status_expiring:
-                                await profile.refresh_status(track)  # длинная пауза между сменами, повтор трека
-                            if track.uri != profile.track_uri:
-                                if rate_wait > 0 and throttled_uri != track.uri:
-                                    throttled_uri = track.uri
-                                    log.info("Слишком часто листаешь — обновлю профиль через %.0f с", rate_wait)
-                                # проснёмся ровно когда новый трек можно ставить
-                                wait = max(MIN_LISTEN - track.progress, rate_wait)
-                                delay = min(POLL_INTERVAL, max(wait + 0.2, 0.5))
-                except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException, RPCError) as e:
-                    log.warning("Ошибка, попробую ещё раз: %s", e)
-                except Exception:
-                    log.exception("Неожиданная ошибка, продолжаю работать")
-                await asyncio.sleep(delay)
-        finally:
-            log.info("Выключаюсь — возвращаю профиль")
-            try:
-                await profile.restore()
-            except Exception as e:
-                log.error("Не удалось вернуть профиль (%s) — вернётся при следующем запуске", e)
+            asyncio.run(run())
+            return  # .stop
+        except KeyboardInterrupt:
+            return
+        except AuthKeyUnregistered:
+            log.error("Сессия Telegram больше не действует. Удали %s и запусти в консоли — попросит номер и код.", session.name)
+            return
+        except Exception:
+            log.exception("Бот упал, перезапущу через %s с", backoff)
+        if time.monotonic() - started > 600:  # долго работал — значит, сбой разовый
+            backoff = 10
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 300)
 
 
 if __name__ == "__main__":
-    sys.stderr.reconfigure(errors="replace")  # иероглифы в названиях не должны ронять логи
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    try:
-        asyncio.run(run())
-    except KeyboardInterrupt:
-        pass
-    except AuthKeyUnregistered:
-        log.error("Сессия Telegram больше не действует. Удали %s.session и запусти снова — "
-                  "попросит номер телефона и код.", os.getenv("TG_SESSION", "my_account"))
+    main()
