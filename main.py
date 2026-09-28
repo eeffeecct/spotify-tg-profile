@@ -7,10 +7,12 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -50,6 +52,7 @@ MAX_UPDATES = int(os.getenv("MAX_UPDATES", 5))
 UPDATE_WINDOW = float(os.getenv("UPDATE_WINDOW", 300))
 EMOJI_STATUS = env_flag("EMOJI_STATUS", True)           # 🎧 в статусе до конца трека (Premium)
 EMOJI_STATUS_ID = os.getenv("EMOJI_STATUS_ID")          # id своего кастомного эмодзи, иначе ищем 🎧
+AUTO_EMOJI = env_flag("AUTO_EMOJI", True)               # сам подбирать эмодзи: слова в названии → жанр → цвет обложки
 PROFILE_COLOR = env_flag("PROFILE_COLOR", True)         # цвет профиля под обложку (Premium)
 
 
@@ -62,6 +65,7 @@ class Track:
     progress: float  # сколько секунд трек уже играет
     duration: float
     artists: tuple[str, ...] = ()
+    artist_ids: tuple[str, ...] = ()
 
     @property
     def bio(self) -> str:
@@ -163,9 +167,11 @@ def fetch_current_track(sp: spotipy.Spotify) -> Track | None:
         progress=(data.get("progress_ms") or 0) / 1000,
         duration=(item.get("duration_ms") or 0) / 1000,
         artists=tuple(a["name"] for a in item.get("artists", [])),
+        artist_ids=tuple(a["id"] for a in item.get("artists", []) if a.get("id")),  # у локальных файлов id нет
     )
 
 
+@lru_cache(maxsize=8)  # обложку качаем один раз: и для цвета/эмодзи, и для аватарки
 def download(url: str) -> bytes:
     response = requests.get(url, timeout=15)
     response.raise_for_status()
@@ -451,20 +457,107 @@ class EmojiRules(RulesFile):
     Ключ: `spotify:track:…` | имя артиста | `~слово` (есть в названии трека) | `*` (вместо 🎧 по умолчанию).
     Эмодзи: обычный символ (🔥 — бот сам найдёт премиум-версию) или `id:символ` кастомного эмодзи."""
 
-    def pick(self, track: Track) -> str | None:
-        """Приоритет: сам трек → артист → слово в названии → `*`."""
+    def pick(self, track: Track) -> tuple[str, str] | None:
+        """Своё правило для трека: сам трек → артист → `~слово`. Возвращает (эмодзи, почему)."""
         self._reload()
-        for key in (track.uri, *track.artists):
-            found = self._find(key)
+        found = self._find(track.uri)
+        if found:
+            return self.entries[found][0], "твоё правило для трека"
+        for artist in track.artists:
+            found = self._find(artist)
             if found:
-                return self.entries[found][0]
+                return self.entries[found][0], f"твоё правило для {artist}"
         title = track.title.lower()
         for key, (value, _) in self.entries.items():
             word = key[1:].strip().lower() if key.startswith("~") else ""
             if word and word in title:
-                return value
+                return value, f"твоё правило ~{word}"
+        return None
+
+    def default(self) -> str | None:
+        self._reload()
         found = self._find("*")
         return self.entries[found][0] if found else None
+
+
+# ---------- автоподбор эмодзи ----------
+
+# слова в названии трека → эмодзи; порядок важен — сначала более точные (heartbreak раньше love, rockstar раньше star)
+_TITLE_WORDS = [
+    (r"heartbreak\w*|broken heart|разбит\w* сердц\w*", "💔"),
+    (r"rock ?star\w*|рок ?стар\w*", "🎸"),
+    (r"love\w*|lover\w*|любов\w*|любви|любл\w*|любим\w*", "❤️"),
+    (r"kiss\w*|lips|поцелу\w*|губ[ыа]?", "💋"),
+    (r"rain\w*|storm\w*|дожд\w*|ливен\w*|ливн\w*|гроз\w*", "🌧"),
+    (r"night\w*|midnight|moon\w*|ноч\w*|полноч\w*|лун[аыеу]\w*", "🌙"),
+    (r"money|cash|dollar\w*|rich|деньг\w*|бабк\w*|кэш\w*|бабл\w*", "💸"),
+    (r"fire|flame\w*|burn\w*|огон\w*|огн\w*|пожар\w*|горит|горю|гори|сгора\w*", "🔥"),
+    (r"dead|death|die|dying|kill\w*|смерт\w*|мертв\w*|мёртв\w*|умер\w*|умир\w*", "💀"),
+    (r"ghost\w*|призрак\w*|привидени\w*", "👻"),
+    (r"angel\w*|heaven\w*|ангел\w*|рай|небес\w*", "😇"),
+    (r"devil\w*|demon\w*|hell|дьявол\w*|демон\w*|ад", "😈"),
+    (r"king\w*|queen\w*|crown|корол\w*|корон\w*|царь|цар[ияю]\w*", "👑"),
+    (r"snow\w*|winter|ice|icy|frozen|cold|снег\w*|снеж\w*|зим\w*|лёд|лед|холод\w*", "❄️"),
+    (r"sun\w*|summer|солнц\w*|солнеч\w*|лет[оа]", "☀️"),
+    (r"stars?|starlight|starboy|звезд\w*|звёзд\w*", "⭐"),
+    (r"rocket\w*|space|galaxy|ракет\w*|космос\w*|космич\w*", "🚀"),
+    (r"cry\w*|tears?|sad\w*|lonely|alone|слез\w*|слёз\w*|груст\w*|плач\w*|плак\w*|одинок\w*", "😢"),
+    (r"party|club|dance\w*|туса\w*|тус[ао]вк\w*|клуб\w*|танц\w*", "🪩"),
+    (r"dream\w*|sleep\w*|сон|сны|снов\w*|мечт\w*", "💭"),
+    (r"sea|ocean\w*|wave\w*|beach|мор[еяю]|океан\w*|волн\w*|пляж\w*", "🌊"),
+    (r"flower\w*|rose\w*|цветы|цвет[оа]к\w*|роз[аыу]", "🌹"),
+    (r"car|cars|drive|driving|speed|тачк\w*|машин\w*|скорост\w*", "🏎"),
+    (r"smoke\w*|high|дым\w*|кур[юи]\w*", "💨"),
+    (r"wine|drunk|вино|пьян\w*|бокал\w*", "🍷"),
+    (r"god|pray\w*|бог\w*|молит\w*|молю", "🙏"),
+    (r"crazy|psycho|insane|безум\w*|псих\w*|бешен\w*", "🤪"),
+    (r"gold\w*|diamond\w*|золот\w*|бриллиант\w*|алмаз\w*", "💎"),
+    (r"phone|call\w*|телефон\w*|звон\w*", "📱"),
+]
+TITLE_EMOJI = [(re.compile(rf"(?<!\w)(?:{pattern})(?!\w)", re.IGNORECASE), emoji) for pattern, emoji in _TITLE_WORDS]
+
+# жанр артиста из Spotify → эмодзи; тоже по порядку (trap раньше rap, k-pop раньше pop)
+GENRE_EMOJI = [
+    ("phonk", "🏎"), ("drill", "🥶"), ("emo", "🖤"), ("trap", "🔥"), ("rap", "🎤"), ("hip hop", "🎤"),
+    ("metal", "🤘"), ("punk", "⚡"), ("rock", "🎸"), ("grunge", "🎸"),
+    ("r&b", "💜"), ("soul", "💜"), ("funk", "🕺"), ("disco", "🪩"), ("jazz", "🎷"), ("blues", "🎷"),
+    ("classical", "🎻"), ("orchestra", "🎻"), ("soundtrack", "🎬"), ("anime", "🌸"),
+    ("house", "🪩"), ("techno", "🪩"), ("edm", "⚡"), ("dubstep", "⚡"), ("electro", "⚡"), ("dance", "🪩"),
+    ("lo-fi", "☕"), ("lofi", "☕"), ("chill", "☕"), ("ambient", "🌌"),
+    ("country", "🤠"), ("reggae", "🌴"), ("reggaeton", "💃"), ("latin", "💃"), ("k-pop", "💜"),
+    ("indie", "🌿"), ("folk", "🌿"), ("pop", "💖"),
+]
+
+
+def title_emoji(title: str) -> tuple[str, str] | None:
+    # «(feat. …)», «[prod. …]» — не часть названия
+    clean = re.sub(r"[(\[][^)\]]*\b(?:feat|ft|prod|with|remix)\b[^)\]]*[)\]]", "", title, flags=re.IGNORECASE)
+    for regex, emoji in TITLE_EMOJI:
+        match = regex.search(clean)
+        if match:
+            return emoji, f"слово «{match.group(0)}» в названии"
+    return None
+
+
+def genre_emoji(genres: list[str]) -> tuple[str, str] | None:
+    for genre in genres:
+        for key, emoji in GENRE_EMOJI:
+            if key in genre.lower():
+                return emoji, f"жанр {genre}"
+    return None
+
+
+def color_heart(rgb: tuple[int, int, int]) -> str:
+    h, s, v = colorsys.rgb_to_hsv(*(c / 255 for c in rgb))
+    if s < 0.2:
+        return "🤍" if v > 0.75 else "🖤" if v < 0.3 else "🩶"
+    deg = h * 360
+    if 15 <= deg < 45 and v < 0.55:
+        return "🤎"
+    for limit, heart in ((15, "❤️"), (45, "🧡"), (70, "💛"), (160, "💚"), (200, "🩵"), (250, "💙"), (290, "💜"), (345, "🩷")):
+        if deg < limit:
+            return heart
+    return "❤️"
 
 
 def parse_emoji(value: str) -> tuple[int | None, str]:
@@ -501,11 +594,12 @@ HELP = """🎧 Команды (пиши в «Избранное»):
 .unban [Имя артиста] — убрать из чёрного списка (без имени — текущий трек)
 .bans — чёрный список
 
-Эмодзи-статус (можно любые премиум-эмодзи из наборов):
+Эмодзи-статус подбирается сам: слова в названии → жанр → цвет обложки.
+Свои правила важнее (можно любые премиум-эмодзи из наборов):
 .emoji 🔥 — для текущего трека
 .emoji Имя артиста 🔥 — для артиста
 .emoji ~слово 🌧 — если слово есть в названии трека
-.emoji * 🎶 — вместо 🎧 по умолчанию
+.emoji * 🎶 — когда слов и жанра нет (вместо сердечка по цвету обложки)
 .unemoji [ключ] — убрать правило (без ключа — текущий трек)
 .emojis — все правила
 
@@ -520,6 +614,8 @@ class Bot:
         self.blacklist = Blacklist(BLACKLIST_FILE)
         self.emoji_rules = EmojiRules(EMOJI_RULES_FILE)
         self._emoji_cache: dict[str, int | None] = {}  # символ -> id премиум-версии
+        self._genres: dict[str, list[str]] = {}  # id артиста -> жанры из Spotify
+        self.emoji_reason = ""  # почему в статусе такой эмодзи (для лога и .status)
         self.lock = asyncio.Lock()  # цикл и команды не должны менять профиль одновременно
         self.stopped = asyncio.Event()
         self.current: Track | None = None  # что сейчас играет в Spotify
@@ -552,13 +648,15 @@ class Bot:
             rate_wait = UPDATE_WINDOW - (loop.time() - self.updates[0]) if len(self.updates) >= MAX_UPDATES else 0
             # быстро листаешь треки — профиль не дёргается: трек должен играть MIN_LISTEN секунд
             if track.uri != self.profile.track_uri and track.progress >= MIN_LISTEN and rate_wait <= 0:
-                await self.profile.show(track, await self.status_emoji(track))
+                emoji_id, self.emoji_reason = await self.status_emoji(track)
+                await self.profile.show(track, emoji_id)
                 self.updates.append(loop.time())
-                log.info("Сейчас играет: %s — %s", track.artist, track.title)
+                log.info("Сейчас играет: %s — %s (статус: %s)", track.artist, track.title, self.emoji_reason)
                 return POLL_INTERVAL
 
             if self.profile.active and self.profile.status_expiring:
-                await self.profile.refresh_status(track, await self.status_emoji(track))  # долгая пауза, повтор трека
+                emoji_id, self.emoji_reason = await self.status_emoji(track)
+                await self.profile.refresh_status(track, emoji_id)  # долгая пауза, повтор трека
             if track.uri == self.profile.track_uri:
                 return POLL_INTERVAL
             if rate_wait > 0 and self.throttled_uri != track.uri:
@@ -626,10 +724,11 @@ class Bot:
         now = f"{self.current.artist} — {self.current.title}" if self.current else "ничего"
         if self.current and self.blacklist.matches(self.current):
             now += " (в чёрном списке)"
-        shown = self.profile.state.get("track_title") or "ничего (профиль как обычно)"
+        shown = self.profile.state.get("track_title")
+        status = f"\nЭмодзи-статус: {self.emoji_reason}" if shown and self.profile.status_enabled else ""
         return (f"{'⏸ На паузе' if self.paused else '▶️ Работает'}\n"
                 f"В Spotify: {now}\n"
-                f"В профиле: {shown}\n"
+                f"В профиле: {shown or 'ничего (профиль как обычно)'}{status}\n"
                 f"В чёрном списке: {len(self.blacklist.items())}\n\n.help — команды")
 
     async def cmd_on(self, arg, message):
@@ -691,22 +790,54 @@ class Bot:
             self._emoji_cache[char] = ids[0] if ids else None
         return self._emoji_cache[char]
 
-    async def status_emoji(self, track: Track) -> int | None:
-        """Эмодзи по правилам из emoji_rules.txt, None — стандартный 🎧."""
-        value = self.emoji_rules.pick(track)
-        if not value:
-            return None
-        emoji_id = await self.resolve_emoji(value)
-        if emoji_id is None:
-            log.warning("Не нашёл премиум-эмодзи «%s» — ставлю стандартный", value)
-        return emoji_id
+    async def artist_genres(self, track: Track) -> list[str]:
+        genres = []
+        for artist_id in track.artist_ids:
+            if artist_id not in self._genres:
+                try:
+                    artist = await asyncio.to_thread(self.sp.artist, artist_id)
+                except (spotipy.SpotifyException, requests.RequestException) as e:
+                    log.warning("Не получил жанры артиста: %s", e)
+                    continue  # не кэшируем — попробуем в следующий раз
+                self._genres[artist_id] = artist.get("genres") or []
+            genres += self._genres[artist_id]
+        return genres
+
+    async def _emoji_candidates(self, track: Track):
+        """Варианты эмодзи по порядку: свои правила → слова в названии → жанр → `*` → цвет обложки."""
+        rule = self.emoji_rules.pick(track)
+        if rule:
+            yield rule
+        if AUTO_EMOJI:
+            hit = title_emoji(track.title)
+            if hit:
+                yield hit
+            hit = genre_emoji(await self.artist_genres(track))
+            if hit:
+                yield hit
+        default = self.emoji_rules.default()
+        if default:
+            yield default, "твоё правило *"
+        if AUTO_EMOJI and track.cover_url:
+            cover = await asyncio.to_thread(download, track.cover_url)
+            yield color_heart(cover_color(cover)), "цвет обложки"
+
+    async def status_emoji(self, track: Track) -> tuple[int | None, str]:
+        """Какой эмодзи поставить в статус и почему. (None, …) — стандартный 🎧."""
+        async for value, reason in self._emoji_candidates(track):
+            emoji_id = await self.resolve_emoji(value)
+            if emoji_id:
+                return emoji_id, f"{parse_emoji(value)[1]} — {reason}"
+            log.warning("Не нашёл премиум-эмодзи «%s» (%s) — пробую следующий вариант", value, reason)
+        return None, "🎧 — по умолчанию"
 
     async def _apply_status_now(self):
         # правило поменяли для того, что сейчас в профиле, — не ждём следующего трека
         async with self.lock:
             track = self.current
             if not self.paused and track and track.uri == self.profile.track_uri:
-                await self.profile.refresh_status(track, await self.status_emoji(track))
+                emoji_id, self.emoji_reason = await self.status_emoji(track)
+                await self.profile.refresh_status(track, emoji_id)
 
     async def cmd_emoji(self, arg, message):
         tokens = arg.split()
