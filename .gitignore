@@ -10,3 +10,4 @@ __pycache__/
 *.log
 *.lock
 blacklist.txt
+emoji_rules.txt

@@ -2,6 +2,7 @@
 🎧 в эмодзи-статус и красит профиль в цвет обложки. Управление — командами в «Избранном» (.help)."""
 import asyncio
 import colorsys
+import html
 import io
 import json
 import logging
@@ -17,7 +18,7 @@ import requests
 import spotipy
 from dotenv import load_dotenv
 from PIL import Image
-from pyrogram import Client, filters, raw, types
+from pyrogram import Client, enums, filters, raw, types
 from pyrogram.errors import AuthKeyUnregistered, FloodWait, RPCError
 from pyrogram.handlers import MessageHandler
 from spotipy.oauth2 import SpotifyOAuth, SpotifyOauthError
@@ -35,6 +36,7 @@ def env_flag(name: str, default: bool) -> bool:
 SPOTIFY_CACHE = BASE_DIR / ".cache"
 STATE_FILE = BASE_DIR / "state.json"  # помним, что поменяли, и исходный профиль между перезапусками
 BLACKLIST_FILE = BASE_DIR / "blacklist.txt"
+EMOJI_RULES_FILE = BASE_DIR / "emoji_rules.txt"
 LOG_FILE = BASE_DIR / "bot.log"
 LOCK_FILE = BASE_DIR / "bot.lock"
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", 5))    # как часто спрашивать Spotify, сек
@@ -202,7 +204,8 @@ class Profile:
     def __init__(self, app: Client):
         self.app = app
         self.state = self._load()
-        self.emoji_status_id: int | None = None
+        self.status_enabled = False
+        self.emoji_status_id: int | None = None  # 🎧 по умолчанию
         self.palette: dict[int, list[int]] = {}  # color_id -> цвета фона профиля
 
     @staticmethod
@@ -240,7 +243,7 @@ class Profile:
         # статус живёт с запасом после конца трека; пока музыка играет — продлеваем заранее,
         # иначе в промежутке Telegram покажет пустой статус (звезду Premium)
         until = self.state.get("status_until")
-        return self.emoji_status_id is not None and until is not None and until - time.time() < POLL_INTERVAL * 2 + 10
+        return self.status_enabled and until is not None and until - time.time() < POLL_INTERVAL * 2 + 10
 
     async def init(self):
         # если прошлый запуск завершился нормально — берём актуальный профиль;
@@ -258,6 +261,7 @@ class Profile:
             return
 
         if EMOJI_STATUS:
+            self.status_enabled = True
             if EMOJI_STATUS_ID:
                 self.emoji_status_id = int(EMOJI_STATUS_ID)
             else:
@@ -309,17 +313,18 @@ class Profile:
             self.state["profile_color_id"] = color_id
         self._save()
 
-    async def refresh_status(self, track: Track):
-        if self.emoji_status_id is None:
+    async def refresh_status(self, track: Track, emoji_id: int | None = None):
+        emoji_id = emoji_id or self.emoji_status_id
+        if not self.status_enabled or emoji_id is None:
             return
         # запас после конца трека покрывает переход к следующему; если бот упадёт — статус всё равно сам исчезнет
         until = int(time.time() + track.remaining + IDLE_TIMEOUT + 30)
         await self._invoke(raw.functions.account.UpdateEmojiStatus(
-            emoji_status=raw.types.EmojiStatus(document_id=self.emoji_status_id, until=until)))
+            emoji_status=raw.types.EmojiStatus(document_id=emoji_id, until=until)))
         self.state["status_until"] = until
         self._save()
 
-    async def show(self, track: Track):
+    async def show(self, track: Track, emoji_id: int | None = None):
         if not track.cover_url:
             await self._delete_our_photo()
         elif track.cover_url != self.state.get("cover_url"):  # тот же альбом — аву и цвет не трогаем
@@ -341,7 +346,7 @@ class Profile:
                 await self._set_profile_color(nearest_profile_color(cover_color(cover), self.palette))
 
         await self._call(self.app.update_profile, bio=track.bio)
-        await self.refresh_status(track)
+        await self.refresh_status(track, emoji_id)
         self.state["track_uri"] = track.uri
         self.state["track_title"] = f"{track.artist} — {track.title}"
         self._save()
@@ -362,15 +367,15 @@ class Profile:
         self._save()
 
 
-# ---------- чёрный список ----------
+# ---------- файлы правил: чёрный список и эмодзи ----------
 
-class Blacklist:
-    """blacklist.txt: по строке на запись — `spotify:track:…` (конкретный трек) или имя артиста.
-    Всё после ` #` — комментарий. Файл можно править руками, бот перечитывает его на лету."""
+class RulesFile:
+    """По строке `ключ` или `ключ = значение`, всё после ` #` — комментарий.
+    Файл можно править руками — бот перечитывает его на лету. Ключи сравниваются без учёта регистра."""
 
     def __init__(self, path: Path):
         self.path = path
-        self.entries: dict[str, str] = {}  # запись -> комментарий
+        self.entries: dict[str, tuple[str, str]] = {}  # ключ -> (значение, комментарий)
         self._mtime: float | None = None
 
     def _reload(self):
@@ -385,29 +390,33 @@ class Blacklist:
         for line in self.path.read_text("utf-8").splitlines():
             if not line.strip() or line.lstrip().startswith("#"):
                 continue
-            key, _, comment = line.partition(" #")
-            self.entries[key.strip()] = comment.strip()
+            body, _, comment = line.partition(" #")
+            key, _, value = body.partition(" = ")
+            self.entries[key.strip()] = (value.strip(), comment.strip())
         self._mtime = mtime
 
     def _write(self):
-        lines = [f"{k}  # {c}" if c else k for k, c in self.entries.items()]
+        lines = []
+        for key, (value, comment) in self.entries.items():
+            line = f"{key} = {value}" if value else key
+            lines.append(f"{line}  # {comment}" if comment else line)
         self.path.write_text("\n".join(lines) + "\n" if lines else "", "utf-8")
         self._mtime = self.path.stat().st_mtime
 
     def _find(self, key: str) -> str | None:
         return next((k for k in self.entries if k.lower() == key.lower()), None)
 
-    def matches(self, track: Track) -> bool:
+    def has(self, key: str) -> bool:
         self._reload()
-        return track.uri in self.entries or any(self._find(a) for a in track.artists)
+        return self._find(key) is not None
 
-    def add(self, key: str, comment: str = "") -> bool:
+    def set(self, key: str, value: str = "", comment: str = ""):
         self._reload()
-        if self._find(key):
-            return False
-        self.entries[key] = comment
+        found = self._find(key)
+        if found:
+            del self.entries[found]
+        self.entries[key] = (value, comment)
         self._write()
-        return True
 
     def remove(self, key: str) -> bool:
         self._reload()
@@ -418,9 +427,67 @@ class Blacklist:
         self._write()
         return True
 
-    def items(self) -> list[tuple[str, str]]:
+    def items(self) -> list[tuple[str, str, str]]:
         self._reload()
-        return list(self.entries.items())
+        return [(k, v, c) for k, (v, c) in self.entries.items()]
+
+
+class Blacklist(RulesFile):
+    """blacklist.txt: `spotify:track:…` (конкретный трек) или имя артиста."""
+
+    def matches(self, track: Track) -> bool:
+        self._reload()
+        return self._find(track.uri) is not None or any(self._find(a) for a in track.artists)
+
+    def add(self, key: str, comment: str = "") -> bool:
+        if self.has(key):
+            return False
+        self.set(key, "", comment)
+        return True
+
+
+class EmojiRules(RulesFile):
+    """emoji_rules.txt: `ключ = эмодзи`.
+    Ключ: `spotify:track:…` | имя артиста | `~слово` (есть в названии трека) | `*` (вместо 🎧 по умолчанию).
+    Эмодзи: обычный символ (🔥 — бот сам найдёт премиум-версию) или `id:символ` кастомного эмодзи."""
+
+    def pick(self, track: Track) -> str | None:
+        """Приоритет: сам трек → артист → слово в названии → `*`."""
+        self._reload()
+        for key in (track.uri, *track.artists):
+            found = self._find(key)
+            if found:
+                return self.entries[found][0]
+        title = track.title.lower()
+        for key, (value, _) in self.entries.items():
+            word = key[1:].strip().lower() if key.startswith("~") else ""
+            if word and word in title:
+                return value
+        found = self._find("*")
+        return self.entries[found][0] if found else None
+
+
+def parse_emoji(value: str) -> tuple[int | None, str]:
+    """`5206…:🔥` / `5206…` / `🔥` → (id кастомного эмодзи или None, символ для показа)."""
+    head, _, tail = value.partition(":")
+    if head.isdigit():
+        return int(head), tail or "⭐"
+    return None, value
+
+
+def emoji_html(value: str) -> str:
+    doc_id, char = parse_emoji(value)
+    return f'<emoji id="{doc_id}">{html.escape(char)}</emoji>' if doc_id else html.escape(char)
+
+
+def describe_rule(key: str, comment: str) -> str:
+    if key.startswith("spotify:track:"):
+        return f"трек «{comment or key}»"
+    if key == "*":
+        return "по умолчанию (вместо 🎧)"
+    if key.startswith("~"):
+        return f"треки со словом «{key[1:].strip()}» в названии"
+    return f"артист {key}"
 
 
 # ---------- бот: цикл + команды в «Избранном» ----------
@@ -433,6 +500,15 @@ HELP = """🎧 Команды (пиши в «Избранное»):
 .ban Имя артиста — скрыть артиста
 .unban [Имя артиста] — убрать из чёрного списка (без имени — текущий трек)
 .bans — чёрный список
+
+Эмодзи-статус (можно любые премиум-эмодзи из наборов):
+.emoji 🔥 — для текущего трека
+.emoji Имя артиста 🔥 — для артиста
+.emoji ~слово 🌧 — если слово есть в названии трека
+.emoji * 🎶 — вместо 🎧 по умолчанию
+.unemoji [ключ] — убрать правило (без ключа — текущий трек)
+.emojis — все правила
+
 .stop — вернуть профиль и выключить бота"""
 
 
@@ -442,6 +518,8 @@ class Bot:
         self.sp = sp
         self.profile = Profile(app)
         self.blacklist = Blacklist(BLACKLIST_FILE)
+        self.emoji_rules = EmojiRules(EMOJI_RULES_FILE)
+        self._emoji_cache: dict[str, int | None] = {}  # символ -> id премиум-версии
         self.lock = asyncio.Lock()  # цикл и команды не должны менять профиль одновременно
         self.stopped = asyncio.Event()
         self.current: Track | None = None  # что сейчас играет в Spotify
@@ -474,13 +552,13 @@ class Bot:
             rate_wait = UPDATE_WINDOW - (loop.time() - self.updates[0]) if len(self.updates) >= MAX_UPDATES else 0
             # быстро листаешь треки — профиль не дёргается: трек должен играть MIN_LISTEN секунд
             if track.uri != self.profile.track_uri and track.progress >= MIN_LISTEN and rate_wait <= 0:
-                await self.profile.show(track)
+                await self.profile.show(track, await self.status_emoji(track))
                 self.updates.append(loop.time())
                 log.info("Сейчас играет: %s — %s", track.artist, track.title)
                 return POLL_INTERVAL
 
             if self.profile.active and self.profile.status_expiring:
-                await self.profile.refresh_status(track)  # длинная пауза между сменами, повтор трека
+                await self.profile.refresh_status(track, await self.status_emoji(track))  # долгая пауза, повтор трека
             if track.uri == self.profile.track_uri:
                 return POLL_INTERVAL
             if rate_wait > 0 and self.throttled_uri != track.uri:
@@ -523,26 +601,28 @@ class Bot:
         handler = {
             ".help": self.cmd_help, ".status": self.cmd_status, ".on": self.cmd_on, ".off": self.cmd_off,
             ".ban": self.cmd_ban, ".unban": self.cmd_unban, ".bans": self.cmd_bans, ".stop": self.cmd_stop,
+            ".emoji": self.cmd_emoji, ".unemoji": self.cmd_unemoji, ".emojis": self.cmd_emojis,
         }.get(cmd.lower())
         if handler is None:  # обычная заметка с точкой — не наше дело
             return
         log.info("Команда: %s", message.text.strip())
         try:
-            reply = await handler(arg.strip())
+            reply = await handler(arg.strip(), message)
         except Exception as e:
             log.exception("Команда %s упала", cmd)
             reply = f"⚠️ Ошибка: {e}"
+        text, mode = reply if isinstance(reply, tuple) else (reply, enums.ParseMode.DISABLED)
         try:
-            await message.edit_text(reply)
+            await message.edit_text(text, parse_mode=mode)
         except RPCError as e:
             log.warning("Не удалось ответить на команду: %s", e)
         if cmd.lower() == ".stop":
             self.stopped.set()
 
-    async def cmd_help(self, _):
+    async def cmd_help(self, arg, message):
         return HELP
 
-    async def cmd_status(self, _):
+    async def cmd_status(self, arg, message):
         now = f"{self.current.artist} — {self.current.title}" if self.current else "ничего"
         if self.current and self.blacklist.matches(self.current):
             now += " (в чёрном списке)"
@@ -552,7 +632,7 @@ class Bot:
                 f"В профиле: {shown}\n"
                 f"В чёрном списке: {len(self.blacklist.items())}\n\n.help — команды")
 
-    async def cmd_on(self, _):
+    async def cmd_on(self, arg, message):
         if not self.paused:
             return "▶️ Бот и так работает"
         self.profile.state.pop("paused", None)
@@ -560,14 +640,14 @@ class Bot:
         self.idle_since = None
         return "▶️ Включил — музыка снова будет в профиле"
 
-    async def cmd_off(self, _):
+    async def cmd_off(self, arg, message):
         async with self.lock:
             self.profile.state["paused"] = True
             await self.profile.restore()
             self.profile._save()
         return "⏸ На паузе, профиль вернул как было. .on — включить"
 
-    async def cmd_ban(self, arg):
+    async def cmd_ban(self, arg, message):
         if arg:
             added = self.blacklist.add(arg)
             text = f"🚫 Артист «{arg}» больше не попадёт в профиль" if added else f"«{arg}» уже в чёрном списке"
@@ -580,7 +660,7 @@ class Bot:
         await self._hide_if_banned()
         return text
 
-    async def cmd_unban(self, arg):
+    async def cmd_unban(self, arg, message):
         if arg:
             return f"✅ «{arg}» убран из чёрного списка" if self.blacklist.remove(arg) else f"«{arg}» нет в чёрном списке"
         if not self.current:
@@ -589,21 +669,90 @@ class Bot:
             return f"✅ Трек «{self.current.artist} — {self.current.title}» убран из чёрного списка"
         return "Этого трека нет в чёрном списке (если скрыт артист — .unban Имя артиста)"
 
-    async def cmd_bans(self, _):
+    async def cmd_bans(self, arg, message):
         items = self.blacklist.items()
         if not items:
             return "Чёрный список пуст. .ban — скрыть текущий трек, .ban Имя — артиста"
-        lines = [f"• {c or k}" + (" (трек)" if k.startswith("spotify:track:") else "") for k, c in items]
+        lines = [f"• {c or k}" + (" (трек)" if k.startswith("spotify:track:") else "") for k, _, c in items]
         return "🚫 Чёрный список:\n" + "\n".join(lines)
 
-    async def cmd_stop(self, _):
+    async def cmd_stop(self, arg, message):
         return "⏹ Выключаюсь, профиль верну как было. Запустить снова — перезайти в Windows или запустить main.py"
+
+    # ----- эмодзи-статус по правилам -----
+
+    async def resolve_emoji(self, value: str) -> int | None:
+        doc_id, char = parse_emoji(value)
+        if doc_id:
+            return doc_id
+        if char not in self._emoji_cache:
+            found = await self.profile._invoke(raw.functions.messages.SearchCustomEmoji(emoticon=char, hash=0))
+            ids = getattr(found, "document_id", None)
+            self._emoji_cache[char] = ids[0] if ids else None
+        return self._emoji_cache[char]
+
+    async def status_emoji(self, track: Track) -> int | None:
+        """Эмодзи по правилам из emoji_rules.txt, None — стандартный 🎧."""
+        value = self.emoji_rules.pick(track)
+        if not value:
+            return None
+        emoji_id = await self.resolve_emoji(value)
+        if emoji_id is None:
+            log.warning("Не нашёл премиум-эмодзи «%s» — ставлю стандартный", value)
+        return emoji_id
+
+    async def _apply_status_now(self):
+        # правило поменяли для того, что сейчас в профиле, — не ждём следующего трека
+        async with self.lock:
+            track = self.current
+            if not self.paused and track and track.uri == self.profile.track_uri:
+                await self.profile.refresh_status(track, await self.status_emoji(track))
+
+    async def cmd_emoji(self, arg, message):
+        tokens = arg.split()
+        if not tokens:
+            return "Как: .emoji 🔥 (текущий трек), .emoji Имя артиста 🔥, .emoji ~слово 🌧, .emoji * 🎶. Все правила — .emojis"
+        emoji_token, key = tokens[-1], " ".join(tokens[:-1])
+        custom = [e for e in (message.entities or []) if e.type == enums.MessageEntityType.CUSTOM_EMOJI]
+        if custom:  # премиум-эмодзи из набора — берём ровно его
+            value = f"{custom[-1].custom_emoji_id}:{emoji_token}"
+        elif await self.resolve_emoji(emoji_token) is not None:
+            value = emoji_token
+        else:
+            return (f"Не нашёл премиум-эмодзи для «{emoji_token}». Эмодзи должен быть последним — "
+                    f"например .emoji {key or 'Имя артиста'} 🔥, или выбери эмодзи из набора в панели")
+        comment = ""
+        if not key:
+            if not self.current:
+                return "Сейчас ничего не играет. Для артиста: .emoji Имя артиста 🔥"
+            key, comment = self.current.uri, f"{self.current.artist} — {self.current.title}"
+        self.emoji_rules.set(key, value, comment)
+        await self._apply_status_now()
+        return f"{emoji_html(value)} теперь для: {html.escape(describe_rule(key, comment))}", enums.ParseMode.HTML
+
+    async def cmd_unemoji(self, arg, message):
+        key = arg
+        if not key:
+            if not self.current:
+                return "Сейчас ничего не играет. Убрать правило: .unemoji Имя артиста (или ~слово, или *)"
+            key = self.current.uri
+        if not self.emoji_rules.remove(key):
+            return "Такого правила нет. Все правила — .emojis"
+        await self._apply_status_now()
+        return "✅ Правило убрано"
+
+    async def cmd_emojis(self, arg, message):
+        items = self.emoji_rules.items()
+        if not items:
+            return "Правил нет — везде 🎧. Добавить: .emoji Имя артиста 🔥"
+        lines = [f"{emoji_html(v)} — {html.escape(describe_rule(k, c))}" for k, v, c in items]
+        return "Эмодзи-статус:\n" + "\n".join(lines), enums.ParseMode.HTML
 
     async def _hide_if_banned(self):
         # если в профиле прямо сейчас то, что забанили, — убираем сразу
         async with self.lock:
             shown = self.profile.track_uri
-            if shown and (shown in dict(self.blacklist.items())
+            if shown and (self.blacklist.has(shown)
                           or (self.current and self.current.uri == shown and self.blacklist.matches(self.current))):
                 await self.profile.restore()
 
