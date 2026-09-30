@@ -10,7 +10,6 @@ import os
 import re
 import sys
 import time
-from collections import deque
 from dataclasses import dataclass
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
@@ -46,10 +45,15 @@ IDLE_TIMEOUT = float(os.getenv("IDLE_TIMEOUT", 60))     # через сколь�
 BIO_TEMPLATE = os.getenv("BIO_TEMPLATE", "🎧 {artist} — {title}")
 BIO_MAX_LEN = int(os.getenv("BIO_MAX_LEN", 70))         # 70 обычный аккаунт, 140 с Premium
 MIN_LISTEN = float(os.getenv("MIN_LISTEN", 5))          # трек должен проиграть столько секунд, чтобы попасть в профиль
-# защита от флуда: не больше MAX_UPDATES смен профиля за UPDATE_WINDOW секунд.
+# защита от флуда для текста/эмодзи/цвета: MAX_UPDATES смен подряд, дальше — по одной раз в UPDATE_REFILL секунд.
 # обычное прослушивание и редкие скипы — мгновенно, притормаживает только если листаешь без остановки
 MAX_UPDATES = int(os.getenv("MAX_UPDATES", 5))
-UPDATE_WINDOW = float(os.getenv("UPDATE_WINDOW", 300))
+UPDATE_REFILL = float(os.getenv("UPDATE_REFILL", 20))
+# аватарок Telegram даёт мало (по опыту — блокировка на часы после ~85 за сутки), поэтому бережём:
+# если треки листают, обложку ставим только тому, что играет PHOTO_MIN_LISTEN секунд, и не больше PHOTO_DAILY_LIMIT в сутки
+PHOTO_MIN_LISTEN = float(os.getenv("PHOTO_MIN_LISTEN", 30))
+PHOTO_DAILY_LIMIT = int(os.getenv("PHOTO_DAILY_LIMIT", 60))
+MAX_FLOOD_SLEEP = 30  # дольше этого FloodWait не пережидаем, а отключаем ограниченную часть профиля
 EMOJI_STATUS = env_flag("EMOJI_STATUS", True)           # 🎧 в статусе до конца трека (Premium)
 EMOJI_STATUS_ID = os.getenv("EMOJI_STATUS_ID")          # id своего кастомного эмодзи, иначе ищем 🎧
 AUTO_EMOJI = env_flag("AUTO_EMOJI", True)               # сам подбирать эмодзи: слова в названии → жанр → цвет обложки
@@ -180,6 +184,15 @@ def download(url: str) -> bytes:
 
 # ---------- Telegram ----------
 
+FEATURES = {"photo": "аватарка", "photo_delete": "удаление аватарки", "bio": "био",
+            "status": "эмодзи-статус", "color": "цвет профиля"}
+
+
+def human_time(seconds: float) -> str:
+    hours, minutes = divmod(round(seconds / 60), 60)
+    return f"{hours} ч {minutes} мин" if hours else f"{minutes} мин" if minutes else f"{round(seconds)} с"
+
+
 def dump_emoji_status(status) -> dict | None:
     if isinstance(status, raw.types.EmojiStatus):
         return {"document_id": status.document_id}
@@ -210,6 +223,9 @@ class Profile:
     def __init__(self, app: Client):
         self.app = app
         self.state = self._load()
+        if "photo_unique_id" in self.state:  # формат до списка photo_ids
+            self.state["photo_ids"] = [self.state.pop("photo_unique_id")]
+        self._limit_logged = False  # про исчерпанный лимит аватарок пишем в лог один раз
         self.status_enabled = False
         self.emoji_status_id: int | None = None  # 🎧 по умолчанию
         self.palette: dict[int, list[int]] = {}  # color_id -> цвета фона профиля
@@ -226,15 +242,55 @@ class Profile:
 
     @staticmethod
     async def _call(func, *args, **kwargs):
+        """Короткий FloodWait пережидаем; длинный отдаём наверх — спать часами, заморозив весь бот, нельзя."""
         while True:
             try:
                 return await func(*args, **kwargs)
             except FloodWait as e:
+                if e.value > MAX_FLOOD_SLEEP:
+                    raise
                 log.warning("Telegram просит подождать %s с", e.value)
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(e.value + 1)
 
     async def _invoke(self, query):
         return await self._call(self.app.invoke, query)
+
+    # ----- лимиты Telegram: если ограничили одну часть профиля, остальные продолжаем обновлять -----
+
+    def blocked_until(self, feature: str) -> float:
+        until = self.state.get("blocked", {}).get(feature, 0)
+        return until if until > time.time() else 0
+
+    def _block(self, feature: str, e: FloodWait):
+        until = time.time() + e.value + 10
+        self.state.setdefault("blocked", {})[feature] = until  # в state — чтобы после перезапуска не долбить заново
+        self._save()
+        log.warning("Telegram ограничил «%s» на %s, до %s. Остальное продолжаю обновлять. Ответ: %s",
+                    FEATURES[feature], human_time(e.value), time.strftime("%d.%m %H:%M", time.localtime(until)), e)
+
+    async def _try(self, feature: str, func, *args, **kwargs) -> bool:
+        if self.blocked_until(feature):
+            return False
+        try:
+            await self._call(func, *args, **kwargs)
+            return True
+        except FloodWait as e:
+            self._block(feature, e)
+            return False
+
+    def photos_used(self) -> int:
+        """Сколько аватарок загрузили за последние сутки."""
+        day_ago = time.time() - 86400
+        self.state["photo_times"] = [t for t in self.state.get("photo_times", []) if t > day_ago]
+        return len(self.state["photo_times"])
+
+    @property
+    def photo_allowed(self) -> bool:
+        return not self.blocked_until("photo") and self.photos_used() < PHOTO_DAILY_LIMIT
+
+    def photo_pending(self, track: Track) -> bool:
+        """Обложки этого трека ещё нет на аватарке, но поставить её можно."""
+        return bool(track.cover_url) and track.cover_url != self.state.get("cover_url") and self.photo_allowed
 
     @property
     def track_uri(self) -> str | None:
@@ -242,7 +298,8 @@ class Profile:
 
     @property
     def active(self) -> bool:
-        return bool(self.state.get("track_uri") or self.state.get("photo_unique_id"))
+        """В профиле сейчас есть что-то наше."""
+        return any(self.state.get(k) for k in ("track_uri", "photo_ids", "status_until", "profile_color_id", "bio_dirty"))
 
     @property
     def status_expiring(self) -> bool:
@@ -261,6 +318,10 @@ class Profile:
             self.state["original_emoji_status"] = dump_emoji_status(me.emoji_status)
             self.state["original_profile_color"] = dump_profile_color(me.profile_color)
             self._save()
+        for feature in FEATURES:
+            if self.blocked_until(feature):
+                log.warning("«%s» всё ещё ограничено Telegram до %s", FEATURES[feature],
+                            time.strftime("%d.%m %H:%M", time.localtime(self.blocked_until(feature))))
 
         if not me.premium and (EMOJI_STATUS or PROFILE_COLOR):
             log.warning("Нет Telegram Premium — эмодзи-статус и цвет профиля выключены")
@@ -285,23 +346,77 @@ class Profile:
                 if not o.hidden and isinstance(o.colors, raw.types.help.PeerColorProfileSet)
             }
 
-    async def _delete_our_photo(self):
-        # храним unique_id, а не file_id: у file_id протухает file_reference после перезапуска
-        unique_id = self.state.pop("photo_unique_id", None)
-        self.state.pop("cover_url", None)
-        if not unique_id:
-            return
-        try:
-            async for p in self.app.get_chat_photos("me", limit=10):
-                if p.big_photo_unique_id == unique_id:
-                    await self._call(self.app.delete_profile_photos, p.big_file_id)
-                    return
-        except RPCError as e:
-            log.warning("Не удалось удалить старую обложку: %s", e)
+    # ----- аватарка -----
 
-    async def _set_profile_color(self, color_id: int | None):
-        if color_id == self.state.get("profile_color_id"):
+    async def _delete_our_photos(self, keep: str | None = None) -> bool:
+        """Удаляет загруженные нами обложки (кроме keep). False — Telegram пока не даёт, повторим позже."""
+        # храним unique_id, а не file_id: у file_id протухает file_reference после перезапуска
+        ours = [u for u in self.state.get("photo_ids", []) if u != keep]
+        if ours:
+            if self.blocked_until("photo_delete"):
+                return False
+            try:
+                async for p in self.app.get_chat_photos("me", limit=20):
+                    if p.big_photo_unique_id in ours:
+                        await self._call(self.app.delete_profile_photos, p.big_file_id)
+            except FloodWait as e:
+                self._block("photo_delete", e)
+                return False
+            except RPCError as e:
+                log.warning("Не удалось удалить старую обложку: %s", e)
+        self.state["photo_ids"] = [keep] if keep else []
+        if not keep:
+            self.state.pop("cover_url", None)
+        self._save()
+        return True
+
+    async def _set_photo(self, cover_url: str) -> bool:
+        cover = await asyncio.to_thread(download, cover_url)
+
+        async def upload():
+            photo = io.BytesIO(cover)  # свежий на каждую попытку
+            photo.name = "cover.jpg"
+            await self.app.set_profile_photo(photo=types.InputChatPhotoStatic(photo))
+
+        if not await self._try("photo", upload):
+            return False
+        self.state.setdefault("photo_times", []).append(time.time())
+        new_id = None
+        try:
+            async for p in self.app.get_chat_photos("me", limit=1):
+                new_id = p.big_photo_unique_id
+        except RPCError as e:
+            log.warning("Не смог запомнить новую аватарку: %s", e)
+        if new_id:
+            self.state.setdefault("photo_ids", []).append(new_id)
+            self.state["cover_url"] = cover_url
+        log.info("Обложка на аватарке (за сутки %s из %s)", self.photos_used(), PHOTO_DAILY_LIMIT)
+        self._save()  # сразу, чтобы после падения не потерять, какую аву мы поставили
+        # сначала поставили новую, теперь удаляем старую — чтобы не мелькала настоящая ава
+        await self._delete_our_photos(keep=new_id)
+        return True
+
+    async def sync_photo(self, track: Track, upload: bool):
+        """Приводит аватарку к треку. Если обложку трека поставить нельзя (лимит) или рано (upload=False,
+        треки листают) — убираем нашу прошлую: лучше настоящая ава, чем обложка от другого трека."""
+        if track.cover_url and track.cover_url == self.state.get("cover_url"):
             return
+        if track.cover_url and upload and self.photo_allowed and await self._set_photo(track.cover_url):
+            self._limit_logged = False
+            return
+        if track.cover_url and not self.photo_allowed and not self._limit_logged:
+            self._limit_logged = True
+            until = self.blocked_until("photo")
+            log.warning("Аватарку пока не меняю: %s. Текст, эмодзи и цвет обновляются как обычно",
+                        f"Telegram ограничил до {time.strftime('%d.%m %H:%M', time.localtime(until))}" if until
+                        else f"за сутки уже {self.photos_used()} из {PHOTO_DAILY_LIMIT} (PHOTO_DAILY_LIMIT)")
+        await self._delete_our_photos()
+
+    # ----- цвет, статус, био -----
+
+    async def _set_profile_color(self, color_id: int | None) -> bool:
+        if color_id == self.state.get("profile_color_id"):
+            return True
         original = self.state.get("original_profile_color") or {}
         if color_id is None:  # вернуть как было
             if "collectible_id" in original:
@@ -312,12 +427,14 @@ class Profile:
                 color = None
         else:  # свой узор на фоне профиля оставляем, меняем только цвет
             color = raw.types.PeerColor(color=color_id, background_emoji_id=original.get("background_emoji_id"))
-        await self._invoke(raw.functions.account.UpdateColor(for_profile=True, color=color))
+        if not await self._try("color", self.app.invoke, raw.functions.account.UpdateColor(for_profile=True, color=color)):
+            return False
         if color_id is None:
             self.state.pop("profile_color_id", None)
         else:
             self.state["profile_color_id"] = color_id
         self._save()
+        return True
 
     async def refresh_status(self, track: Track, emoji_id: int | None = None):
         emoji_id = emoji_id or self.emoji_status_id
@@ -325,52 +442,46 @@ class Profile:
             return
         # запас после конца трека покрывает переход к следующему; если бот упадёт — статус всё равно сам исчезнет
         until = int(time.time() + track.remaining + IDLE_TIMEOUT + 30)
-        await self._invoke(raw.functions.account.UpdateEmojiStatus(
-            emoji_status=raw.types.EmojiStatus(document_id=emoji_id, until=until)))
-        self.state["status_until"] = until
-        self._save()
+        if await self._try("status", self.app.invoke, raw.functions.account.UpdateEmojiStatus(
+                emoji_status=raw.types.EmojiStatus(document_id=emoji_id, until=until))):
+            self.state["status_until"] = until
+            self._save()
 
-    async def show(self, track: Track, emoji_id: int | None = None):
-        if not track.cover_url:
-            await self._delete_our_photo()
-        elif track.cover_url != self.state.get("cover_url"):  # тот же альбом — аву и цвет не трогаем
-            cover = await asyncio.to_thread(download, track.cover_url)
-            photo = io.BytesIO(cover)
-            photo.name = "cover.jpg"
-            await self._call(self.app.set_profile_photo, photo=types.InputChatPhotoStatic(photo))
-            # сначала ставим новую, потом удаляем старую — чтобы не мелькала настоящая ава
-            new_photo = None
-            async for p in self.app.get_chat_photos("me", limit=1):
-                new_photo = p
-            await self._delete_our_photo()
-            if new_photo:
-                self.state["photo_unique_id"] = new_photo.big_photo_unique_id
-                self.state["cover_url"] = track.cover_url
-            self._save()  # сразу, чтобы после падения не потерять, какую аву мы поставили
-
-            if self.palette:
-                await self._set_profile_color(nearest_profile_color(cover_color(cover), self.palette))
-
-        await self._call(self.app.update_profile, bio=track.bio)
-        await self.refresh_status(track, emoji_id)
+    async def show(self, track: Track, emoji_id: int | None = None, with_photo: bool = True):
+        # сначала быстрое и дешёвое (текст, эмодзи, цвет), аватарка — в конце
+        await self._try("bio", self.app.update_profile, bio=track.bio)
         self.state["track_uri"] = track.uri
         self.state["track_title"] = f"{track.artist} — {track.title}"
         self._save()
+        await self.refresh_status(track, emoji_id)
+        if self.palette and track.cover_url:
+            cover = await asyncio.to_thread(download, track.cover_url)
+            await self._set_profile_color(nearest_profile_color(cover_color(cover), self.palette))
+        await self.sync_photo(track, upload=with_photo)
 
-    async def restore(self):
+    async def restore(self) -> bool:
+        """Возвращает профиль как был. False — что-то Telegram пока не дал вернуть, повторим позже."""
         if not self.active:
-            return
-        await self._delete_our_photo()
-        await self._call(self.app.update_profile, bio=self.state.get("original_bio", ""))
-        if "status_until" in self.state:
-            await self._invoke(raw.functions.account.UpdateEmojiStatus(
-                emoji_status=load_emoji_status(self.state.get("original_emoji_status"))))
-            self.state.pop("status_until")
-        if "profile_color_id" in self.state:
-            await self._set_profile_color(None)
+            return True
+        done = await self._delete_our_photos()
+        if self.state.get("track_uri") or self.state.get("bio_dirty"):
+            if await self._try("bio", self.app.update_profile, bio=self.state.get("original_bio", "")):
+                self.state.pop("bio_dirty", None)
+            else:
+                self.state["bio_dirty"] = True
+                done = False
         self.state.pop("track_uri", None)
         self.state.pop("track_title", None)
+        if "status_until" in self.state:
+            if await self._try("status", self.app.invoke, raw.functions.account.UpdateEmojiStatus(
+                    emoji_status=load_emoji_status(self.state.get("original_emoji_status")))):
+                self.state.pop("status_until")
+            else:
+                done = False
+        if "profile_color_id" in self.state:
+            done = await self._set_profile_color(None) and done
         self._save()
+        return done
 
 
 # ---------- файлы правил: чёрный список и эмодзи ----------
@@ -621,7 +732,11 @@ class Bot:
         self.current: Track | None = None  # что сейчас играет в Spotify
         self.idle_since: float | None = None
         self.throttled_uri: str | None = None  # чтобы писать в лог про лимит один раз на трек
-        self.updates: deque[float] = deque()  # когда меняли профиль (для лимита MAX_UPDATES / UPDATE_WINDOW)
+        self.restore_logged = False
+        self.tokens = float(MAX_UPDATES)  # сколько смен профиля можно сделать прямо сейчас
+        self.tokens_at: float | None = None
+        self.last_show = float("-inf")
+        self.photo_tried_uri: str | None = None  # отложенную аватарку пробуем один раз на трек
 
     @property
     def paused(self) -> bool:
@@ -638,33 +753,52 @@ class Bot:
             if track is None or self.blacklist.matches(track):  # трек из чёрного списка = ничего не играет
                 self.idle_since = self.idle_since or loop.time()
                 if self.profile.active and loop.time() - self.idle_since >= IDLE_TIMEOUT:
-                    log.info("Музыка не играет — возвращаю профиль")
+                    if not self.restore_logged:
+                        self.restore_logged = True
+                        log.info("Музыка не играет — возвращаю профиль")
                     await self.profile.restore()
                 return POLL_INTERVAL
 
             self.idle_since = None
-            while self.updates and loop.time() - self.updates[0] >= UPDATE_WINDOW:
-                self.updates.popleft()
-            rate_wait = UPDATE_WINDOW - (loop.time() - self.updates[0]) if len(self.updates) >= MAX_UPDATES else 0
+            self.restore_logged = False
+            now = loop.time()
+            if self.tokens_at is not None:
+                self.tokens = min(MAX_UPDATES, self.tokens + (now - self.tokens_at) / UPDATE_REFILL)
+            self.tokens_at = now
+            rate_wait = 0 if self.tokens >= 1 else (1 - self.tokens) * UPDATE_REFILL
             # быстро листаешь треки — профиль не дёргается: трек должен играть MIN_LISTEN секунд
             if track.uri != self.profile.track_uri and track.progress >= MIN_LISTEN and rate_wait <= 0:
+                # прошлый трек слушали, а не пролистали — обложку ставим сразу; иначе ждём PHOTO_MIN_LISTEN
+                calm = now - self.last_show >= PHOTO_MIN_LISTEN + 15
                 emoji_id, self.emoji_reason = await self.status_emoji(track)
-                await self.profile.show(track, emoji_id)
-                self.updates.append(loop.time())
+                self.photo_tried_uri = None
+                await self.profile.show(track, emoji_id, with_photo=calm or track.progress >= PHOTO_MIN_LISTEN)
+                self.tokens -= 1
+                self.last_show = now
                 log.info("Сейчас играет: %s — %s (статус: %s)", track.artist, track.title, self.emoji_reason)
-                return POLL_INTERVAL
+                return self._photo_delay(track)
 
             if self.profile.active and self.profile.status_expiring:
                 emoji_id, self.emoji_reason = await self.status_emoji(track)
                 await self.profile.refresh_status(track, emoji_id)  # долгая пауза, повтор трека
             if track.uri == self.profile.track_uri:
-                return POLL_INTERVAL
-            if rate_wait > 0 and self.throttled_uri != track.uri:
+                if (self.profile.photo_pending(track) and track.progress >= PHOTO_MIN_LISTEN
+                        and self.photo_tried_uri != track.uri):
+                    self.photo_tried_uri = track.uri
+                    await self.profile.sync_photo(track, upload=True)  # трек прижился — теперь и обложку
+                return self._photo_delay(track)
+            if rate_wait > 1 and self.throttled_uri != track.uri:
                 self.throttled_uri = track.uri
                 log.info("Слишком часто листаешь — обновлю профиль через %.0f с", rate_wait)
             # проснёмся ровно когда новый трек можно ставить
             wait = max(MIN_LISTEN - track.progress, rate_wait)
             return min(POLL_INTERVAL, max(wait + 0.2, 0.5))
+
+    def _photo_delay(self, track: Track) -> float:
+        """Через сколько проснуться, чтобы вовремя поставить отложенную обложку."""
+        if self.profile.photo_pending(track) and track.progress < PHOTO_MIN_LISTEN and self.photo_tried_uri != track.uri:
+            return min(POLL_INTERVAL, max(PHOTO_MIN_LISTEN - track.progress + 0.2, 0.5))
+        return POLL_INTERVAL
 
     async def run(self):
         await self.profile.init()
@@ -676,6 +810,10 @@ class Bot:
                 delay = POLL_INTERVAL
                 try:
                     delay = await self.tick()
+                except FloodWait as e:  # лимит на чём-то служебном — просто ждём, не долбим
+                    delay = min(e.value, 600)
+                    log.warning("Telegram просит подождать %s — следующая попытка через %s. Ответ: %s",
+                                human_time(e.value), human_time(delay), e)
                 except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException, RPCError) as e:
                     log.warning("Ошибка, попробую ещё раз: %s", e)
                 except Exception:
@@ -726,9 +864,13 @@ class Bot:
             now += " (в чёрном списке)"
         shown = self.profile.state.get("track_title")
         status = f"\nЭмодзи-статус: {self.emoji_reason}" if shown and self.profile.status_enabled else ""
+        limits = "".join(
+            f"\n⛔ {FEATURES[f]}: Telegram ограничил до {time.strftime('%d.%m %H:%M', time.localtime(self.profile.blocked_until(f)))}"
+            for f in FEATURES if self.profile.blocked_until(f))
         return (f"{'⏸ На паузе' if self.paused else '▶️ Работает'}\n"
                 f"В Spotify: {now}\n"
                 f"В профиле: {shown or 'ничего (профиль как обычно)'}{status}\n"
+                f"Аватарок за сутки: {self.profile.photos_used()} из {PHOTO_DAILY_LIMIT}{limits}\n"
                 f"В чёрном списке: {len(self.blacklist.items())}\n\n.help — команды")
 
     async def cmd_on(self, arg, message):
